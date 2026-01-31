@@ -1,0 +1,5 @@
+/node_modules
+/config/config.env
+# hoặc nếu bạn dùng .env:
+# .env
+seed_library.js
