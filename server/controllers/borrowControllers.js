@@ -11,9 +11,17 @@ import crypto from "crypto";
 // 🛠️ HÀM CÔNG CỤ (HELPER FUNCTIONS)
 // =================================================================
 
+
 /**
- * Hàm sắp xếp object theo thứ tự alphabet của key.
- * Cần thiết cho việc tạo chữ ký bảo mật của VNPAY.
+ * CHỨC NĂNG: Sắp xếp object theo thứ tự alphabet của key
+ *
+ * Mục đích:
+ * - VNPAY yêu cầu các tham số phải được sắp xếp đúng thứ tự trước khi tạo chữ ký bảo mật
+ *
+ * Luồng xử lý:
+ * 1. Lấy danh sách keys của obj
+ * 2. Sort keys theo alphabet (A -> Z)
+ * 3. Tạo object mới theo thứ tự đó
  */
 const sortObject = (obj) => {
   const sorted = {};
@@ -22,12 +30,25 @@ const sortObject = (obj) => {
   return sorted;
 };
 
+
+
 /**
- * Hàm tạo URL thanh toán VNPAY.
- * - amountVnd: Số tiền cần thanh toán (VNĐ)
- * - txnRef: Mã giao dịch (duy nhất)
- * - orderInfo: Thông tin đơn hàng
- * - ipAddr: Địa chỉ IP của người dùng
+ * CHỨC NĂNG: Tạo URL thanh toán VNPAY
+ *
+ * Input:
+ * - amountVnd: số tiền (VNĐ)
+ * - txnRef: mã giao dịch duy nhất
+ * - orderInfo: mô tả đơn hàng
+ * - ipAddr: IP người dùng
+ *
+ * Luồng xử lý:
+ * 1. Lấy ENV cấu hình VNPAY (tmnCode, secretKey, vnpUrl, returnUrl)
+ * 2. Tạo vnp_CreateDate dạng YYYYMMDDHHmmss
+ * 3. Đổi amount sang đơn vị VNPAY yêu cầu: amount * 100
+ * 4. Build object vnp_Params (Version/Command/TmnCode/Amount/ReturnUrl...)
+ * 5. Sort tham số trước khi ký
+ * 6. Tạo SecureHash bằng HMAC SHA512 (secretKey)
+ * 7. Ghép thành URL hoàn chỉnh trả về frontend
  */
 const createVnpayUrl = ({ amountVnd, txnRef, orderInfo, ipAddr }) => {
   const tmnCode = process.env.VNP_TMN_CODE;
@@ -86,16 +107,40 @@ const createVnpayUrl = ({ amountVnd, txnRef, orderInfo, ipAddr }) => {
   return paymentUrl;
 };
 
-// Cấu hình số ngày mượn và gia hạn
+
+
+/**
+ * CHỨC NĂNG: Cấu hình số ngày mượn và gia hạn
+ * - BORROW_DAYS: số ngày được mượn ban đầu
+ * - RENEW_DAYS: số ngày cộng thêm mỗi lần gia hạn
+ * - MAX_RENEWALS: số lần gia hạn tối đa
+ */
 const BORROW_DAYS = 7;
 const RENEW_DAYS = 7;
 const MAX_RENEWALS = 2;
 
+
+
+
 /**
- * Hàm xử lý logic trả sách sau khi đã thanh toán thành công (hoặc xác nhận tiền mặt).
- * - Cập nhật ngày trả (returnDate).
- * - Cập nhật trạng thái BookCopy thành "available".
- * - Tăng số lượng sách trong kho (Book.quantity).
+ * CHỨC NĂNG: Hoàn tất trả sách sau khi thanh toán thành công (hoặc xác nhận tiền mặt)
+ *
+ * Mục tiêu:
+ * - Đánh dấu Borrow đã trả (returnDate)
+ * - Đánh dấu User.borrowedBooks item -> returned = true
+ * - Đổi BookCopy.status về "available" và xóa currentBorrowId
+ * - Tăng Book.quantity và cập nhật availability
+ *
+ * Luồng xử lý:
+ * 1. Tìm Borrow theo borrowId
+ * 2. Nếu Borrow đã trả rồi -> return luôn
+ * 3. Tìm User theo borrow.user.id
+ * 4. Nếu Borrow thiếu borrow.book -> tìm lại từ BookCopy.bookId
+ * 5. Tìm Book và BookCopy
+ * 6. Set borrow.returnDate = now
+ * 7. Cập nhật snapshot user.borrowedBooks -> returned = true
+ * 8. Update BookCopy: chỉ cho trả nếu currentBorrowId khớp borrow._id
+ * 9. Update Book: quantity +1, availability theo quantity
  */
 const finalizeReturnAfterPaid = async ({ borrowId }) => {
   const borrow = await Borrow.findById(borrowId);
@@ -150,10 +195,29 @@ const finalizeReturnAfterPaid = async ({ borrowId }) => {
   return borrow;
 };
 
+
+
 /**
- * ===============================
- * 📌 GHI NHẬN VIỆC MƯỢN SÁCH (CÓ LOG CHI TIẾT)
- * ===============================
+ * CHỨC NĂNG: Ghi nhận lượt mượn sách (theo BookCopy)
+ * ROUTE (gợi ý): POST /api/v1/borrow/:id
+ *
+ * Input:
+ * - params: id = bookId
+ * - body: email, copyId (optional)
+ *
+ * Luồng xử lý:
+ * 1. Tìm Book theo bookId
+ * 2. Tìm User theo email (đã xác thực)
+ * 3. Kiểm tra user có đang mượn cùng đầu sách này chưa (returned=false)
+ * 4. "Khóa" BookCopy:
+ *    - Nếu có copyId: khóa đúng cuốn đó (status available -> borrowed)
+ *    - Nếu không có copyId: tự lấy 1 cuốn available bất kỳ
+ * 5. Tính dueDate = hiện tại + BORROW_DAYS
+ * 6. Tạo Borrow record (gắn bookId + bookCopyId + snapshot user + payment pending)
+ * 7. Update BookCopy.currentBorrowId = borrow._id
+ * 8. Giảm Book.quantity đi 1, cập nhật availability
+ * 9. Push snapshot vào user.borrowedBooks để UI hiển thị nhanh
+ * 10. Trả về borrow + copyCode
  */
 export const recordBorrowedBook = catchAsyncErrors(async (req, res, next) => {
   console.log("\n=== 📋 recordBorrowedBook START ===");
@@ -292,10 +356,27 @@ export const recordBorrowedBook = catchAsyncErrors(async (req, res, next) => {
   });
 });
 
+
+
+
 /**
- * ===============================
- * 📌 GIA HẠN SÁCH
- * ===============================
+ * CHỨC NĂNG: Gia hạn lượt mượn
+ * ROUTE (gợi ý): PATCH /api/v1/borrow/renew/:borrowId
+ *
+ * Điều kiện:
+ * - Borrow phải thuộc về user đang đăng nhập
+ * - Borrow chưa trả (returnDate = null)
+ * - Chưa quá hạn (dueDate > now)
+ * - renewCount < MAX_RENEWALS
+ *
+ * Luồng xử lý:
+ * 1. Tìm Borrow theo borrowId + userId + returnDate=null
+ * 2. Nếu quá hạn -> báo lỗi không cho gia hạn
+ * 3. Nếu vượt số lần gia hạn -> báo lỗi
+ * 4. Tính newDueDate = dueDate + RENEW_DAYS
+ * 5. Update Borrow: dueDate, renewCount++, lastRenewedAt
+ * 6. Update snapshot trong user.borrowedBooks để UI hiển thị đúng
+ * 7. Trả về dueDate mới + renewCount
  */
 export const renewBorrowedBook = catchAsyncErrors(async (req, res, next) => {
   const { borrowId } = req.params;
@@ -358,10 +439,34 @@ export const renewBorrowedBook = catchAsyncErrors(async (req, res, next) => {
   });
 });
 
+
+
 /**
- * ===============================
- * 📌 CHUẨN BỊ THANH TOÁN TRẢ SÁCH (TÍNH TIỀN + TẠO PAYMENT)
- * ===============================
+ * CHỨC NĂNG: Chuẩn bị trả sách (tính tiền + tạo payment)
+ * ROUTE (gợi ý): POST /api/v1/borrow/return/prepare/:borrowId
+ * (code hỗ trợ fallback :borrowId hoặc :bookId)
+ *
+ * Input:
+ * - params: borrowId hoặc bookId
+ * - body: email, method ("cash" | "vnpay")
+ *
+ * Luồng xử lý:
+ * 1. Validate email + method
+ * 2. Tìm Borrow chưa trả theo:
+ *    - _id + user.email + returnDate=null
+ *    - nếu không có thì fallback: book + user.email + returnDate=null
+ * 3. Nếu Borrow thiếu bookId -> lấy lại qua BookCopy.bookId
+ * 4. Tìm Book
+ * 5. Tính fine = calculateFine(dueDate)
+ * 6. total = book.price + fine
+ * 7. Update borrow.payment: method, amount, status="pending"
+ * 8. Nếu cash:
+ *    - trả về amount + message cho admin thu tiền
+ * 9. Nếu vnpay:
+ *    - tạo txnRef
+ *    - gắn txnRef vào borrow.payment.transactionId
+ *    - tạo paymentUrl bằng createVnpayUrl()
+ *    - trả về paymentUrl để frontend redirect
  */
 export const prepareReturnPayment = catchAsyncErrors(async (req, res, next) => {
   const anyId = req.params.borrowId || req.params.bookId;
@@ -461,10 +566,26 @@ export const prepareReturnPayment = catchAsyncErrors(async (req, res, next) => {
   return next(new ErrorHandler("ZaloPay chưa được tích hợp trong bản sửa này.", 400));
 });
 
+
+
+
+
 /**
- * ===============================
- * 📌 XỬ LÝ CALLBACK TỪ VNPAY (VNPAY IPN / RETURN)
- * ===============================
+ * CHỨC NĂNG: Nhận kết quả thanh toán từ VNPAY (return/IPN)
+ * ROUTE (gợi ý): GET /api/v1/borrow/vnpay/return
+ *
+ * Luồng xử lý:
+ * 1. Lấy req.query thành vnp_Params
+ * 2. Lấy vnp_SecureHash rồi xóa secureHash khỏi params để ký lại
+ * 3. Tính lại chữ ký HMAC SHA512 với secretKey
+ * 4. Nếu chữ ký sai -> redirect về frontend với status=failed
+ * 5. Lấy responseCode và txnRef
+ * 6. Tìm Borrow theo payment.transactionId = txnRef
+ * 7. Nếu responseCode != "00" -> payment.failed, redirect failed
+ * 8. Nếu thành công:
+ *    - payment.paid, paidAt=now
+ *    - gọi finalizeReturnAfterPaid() để thực sự trả sách
+ * 9. Redirect về frontend /payment-result?status=success
  */
 export const vnpayReturn = catchAsyncErrors(async (req, res, next) => {
   const vnp_Params = { ...req.query };
@@ -521,10 +642,26 @@ export const vnpayReturn = catchAsyncErrors(async (req, res, next) => {
   return res.redirect(`${appBaseUrl}/payment-result?status=success`);
 });
 
+
+
+
 /**
- * ===============================
- * 📌 XÁC NHẬN THANH TOÁN TIỀN MẶT (BỞI ADMIN/THỦ THƯ)
- * ===============================
+ * CHỨC NĂNG: Admin xác nhận đã thu tiền mặt + hoàn tất trả sách
+ * ROUTE (gợi ý): POST /api/v1/borrow/return/confirm-cash/:borrowId
+ *
+ * Input:
+ * - params: borrowId hoặc bookId
+ * - body: email
+ *
+ * Luồng xử lý:
+ * 1. Tìm Borrow chưa trả theo _id hoặc theo book
+ * 2. Kiểm tra payment.method phải là "cash"
+ * 3. Set payment.status="paid", payment.paidAt=now
+ * 4. Gọi finalizeReturnAfterPaid() để:
+ *    - set returnDate
+ *    - đổi BookCopy -> available
+ *    - tăng Book.quantity
+ * 5. Trả response success
  */
 export const confirmCashPaymentAndReturn = catchAsyncErrors(async (req, res, next) => {
   const anyId = req.params.borrowId || req.params.bookId;
@@ -564,7 +701,14 @@ export const confirmCashPaymentAndReturn = catchAsyncErrors(async (req, res, nex
   });
 });
 
-// API cũ, báo lỗi để hướng dẫn dùng API mới
+
+
+
+/**
+ * CHỨC NĂNG: API cũ (deprecated)
+ * - Không dùng nữa
+ * - Trả lỗi để hướng dẫn gọi API mới (prepare payment trước)
+ */
 export const returnBorrowBook = catchAsyncErrors(async (req, res, next) => {
   return next(
     new ErrorHandler(
@@ -574,7 +718,13 @@ export const returnBorrowBook = catchAsyncErrors(async (req, res, next) => {
   );
 });
 
-// Admin lấy danh sách sách user đang mượn (để hiển thị)
+
+
+/**
+ * CHỨC NĂNG: Lấy danh sách borrowedBooks của user đang đăng nhập
+ * - Dữ liệu lấy từ req.user.borrowedBooks (snapshot trong User)
+ * - Dùng cho màn hình user theo dõi sách đang mượn
+ */
 export const borrowedBooks = catchAsyncErrors(async (req, res, next) => {
   const { borrowedBooks } = req.user;
 
@@ -584,7 +734,17 @@ export const borrowedBooks = catchAsyncErrors(async (req, res, next) => {
   });
 });
 
-// Admin lấy toàn bộ danh sách mượn
+
+
+
+/**
+ * CHỨC NĂNG: Admin xem toàn bộ lịch sử mượn
+ *
+ * Luồng xử lý:
+ * 1. Lấy tất cả Borrow
+ * 2. Populate book (title, author) để hiển thị dễ
+ * 3. Populate bookCopy (copyCode, status) để biết cuốn nào đang mượn
+ */
 export const getBorrowedBooksForAdmin = catchAsyncErrors(async (req, res, next) => {
   const borrowedBooks = await Borrow.find()
     .populate("book", "title author")
